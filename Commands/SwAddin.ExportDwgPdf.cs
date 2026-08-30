@@ -51,6 +51,9 @@ namespace Mtools
                     return;
                 }
 
+                // 导出前：图面布满显示（整屏 / 适应窗口）
+                ZoomDrawingToFit(doc);
+
                 string shortName = Path.ChangeExtension(fileName, null);
                 string dwgName = shortName + ".DWG";
                 string pdfName = shortName + ".PDF";

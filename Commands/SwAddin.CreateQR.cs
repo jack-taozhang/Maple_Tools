@@ -71,6 +71,9 @@ namespace Mtools
 
                 DrawingDoc drawDoc = (DrawingDoc)modDoc;
 
+                // 赋二维码前：图面布满显示（整屏 / 适应窗口）
+                ZoomDrawingToFit(modDoc);
+
                 // 2. 读取图纸模型属性信息，查找图号
                 string drawingNumber = GetDrawingNumber(modDoc);
 
@@ -124,6 +127,21 @@ namespace Mtools
                 MessageBox.Show("发生错误: " + ex.Message, "Mtools",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
+        }
+
+        /// <summary>
+        /// 图面布满显示：将当前工程图缩放至充满整个图形区域（等同"整屏显示 / 适应窗口"）。
+        /// 仅影响屏幕显示，不改变图纸几何与导出比例。
+        /// </summary>
+        private void ZoomDrawingToFit(IModelDoc2 modDoc)
+        {
+            if (modDoc == null) return;
+            try
+            {
+                // ViewZoomtofit2 将模型/工程图缩放至适配图形区
+                modDoc.ViewZoomtofit2();
+            }
+            catch (Exception) { }
         }
 
         // ====================================================================
@@ -218,84 +236,79 @@ namespace Mtools
         }
 
         /// <summary>
-        /// 使用 QRCoder 生成二维码 PNG 图片：
-        /// - 黑色像素保留为不透明黑
-        /// - 背景白色及其他非黑色像素设为完全透明（alpha=0）
-        /// 这样在 SW 工程图中插入时背景不会遮挡图框/尺寸标注。
+        /// 使用 QRCoder 生成二维码 BMP 图片：
+        /// - 黑模块 + 纯白底（不透明）
+        /// - 边缘额外增加 2 像素白边框
+        /// - 以 BMP 格式保存（无 alpha 通道），插入时白底为不透明白。
         /// </summary>
         private string GenerateQRCodeImage(string content)
         {
             string tempPath = Path.Combine(Path.GetTempPath(),
-                "Mtools_QR_" + Guid.NewGuid().ToString("N") + ".png");
+                "Mtools_QR_" + Guid.NewGuid().ToString("N") + ".bmp");
 
             using (QRCodeGenerator qrGenerator = new QRCodeGenerator())
             using (QRCodeData qrCodeData = qrGenerator.CreateQrCode(content, QRCodeGenerator.ECCLevel.Q))
             using (QRCode qrCode = new QRCode(qrCodeData))
-            // 第2参数 darkColor=黑，第3参数 lightColor=白，先按白底生成；
-            // QRCoder 直接传 Color.Transparent 时部分版本不保证生成带 alpha 的 PNG，
-            // 因此采用"白底生成 + 后处理显式转透明"方案，保证任何 SW 版本都能正确识别。
-            using (Bitmap rawBitmap = qrCode.GetGraphic(20, Color.Black, Color.White, true))
+            // 第2参数 darkColor=黑，第3参数 lightColor=白：直接生成"黑模块 + 白底"位图；
+            // drawQuietZones=false：不保留 QRCoder 自带的留白边（约 4 模块白边），
+            // 白色仅由下方 2 像素边框提供，避免二维码四周白区过大。
+            using (Bitmap rawBitmap = qrCode.GetGraphic(20, Color.Black, Color.White, false))
             {
-                // 1) 显式转为 32bppArgb 格式（确保 PNG 保存时带 alpha 通道）
-                Bitmap bmp32 = new Bitmap(rawBitmap.Width, rawBitmap.Height, PixelFormat.Format32bppArgb);
-                using (Graphics g = Graphics.FromImage(bmp32))
-                {
-                    g.DrawImage(rawBitmap, 0, 0, rawBitmap.Width, rawBitmap.Height);
-                }
+                int border = 2; // 边缘白边框像素
 
-                // 2) 用 LockBits 高效遍历像素：黑色(0,0,0)保留不透明，其余 alpha=0
-                //    二维码本身只有"黑模块"和"白空"两种像素，因此"非黑"即"白"。
-                //    用 RGB 三通道判断而非 Color.Equals，避免抗锯齿灰度像素被误判。
-                BitmapData bmpData = bmp32.LockBits(
-                    new Rectangle(0, 0, bmp32.Width, bmp32.Height),
-                    ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
-                try
+                // 目标画布 = 原图 + 四周各 border 像素白边，24bpp RGB（无 alpha 通道）
+                int w = rawBitmap.Width + border * 2;
+                int h = rawBitmap.Height + border * 2;
+                using (Bitmap bmpOut = new Bitmap(w, h, PixelFormat.Format24bppRgb))
                 {
-                    int bytesPerPixel = 4;
-                    int byteCount = bmpData.Stride * bmp32.Height;
-                    byte[] rgbaValues = new byte[byteCount];
-                    Marshal.Copy(bmpData.Scan0, rgbaValues, 0, byteCount);
-
-                    for (int i = 0; i < byteCount; i += bytesPerPixel)
+                    using (Graphics g = Graphics.FromImage(bmpOut))
                     {
-                        // Format32bppArgb 在内存中字节顺序：B, G, R, A（小端）
-                        byte b = rgbaValues[i + 0];
-                        byte g = rgbaValues[i + 1];
-                        byte r = rgbaValues[i + 2];
-
-                        // 判定为"黑色模块"：三通道均 ≤ 64（足够宽容，抗锯齿边也保留）
-                        bool isBlackModule = r <= 64 && g <= 64 && b <= 64;
-                        if (!isBlackModule)
-                        {
-                            // 非黑色像素 → 完全透明
-                            rgbaValues[i + 0] = 0;  // B
-                            rgbaValues[i + 1] = 0;  // G
-                            rgbaValues[i + 2] = 0;  // R
-                            rgbaValues[i + 3] = 0;  // A = 0（完全透明）
-                        }
-                        else
-                        {
-                            // 黑色模块 → 不透明黑
-                            rgbaValues[i + 0] = 0;  // B
-                            rgbaValues[i + 1] = 0;  // G
-                            rgbaValues[i + 2] = 0;  // R
-                            rgbaValues[i + 3] = 255; // A = 255（不透明）
-                        }
+                        // 先整体填白，再把二维码绘制到内缩 border 像素的位置 → 四周留出白边框
+                        g.Clear(Color.White);
+                        g.DrawImage(rawBitmap, border, border, rawBitmap.Width, rawBitmap.Height);
                     }
 
-                    Marshal.Copy(rgbaValues, 0, bmpData.Scan0, byteCount);
+                    // 保存为 BMP
+                    bmpOut.Save(tempPath, ImageFormat.Bmp);
                 }
-                finally
-                {
-                    bmp32.UnlockBits(bmpData);
-                }
-
-                // 3) 保存为带 alpha 通道的 PNG
-                bmp32.Save(tempPath, ImageFormat.Png);
-                bmp32.Dispose();
             }
 
             return tempPath;
+        }
+
+        // 二维码草图图片特征名标记：插入时写入，删除时据此可靠识别（无需坐标探针）
+        private const string QR_FEATURE_MARKER = "MtoolsQRCode";
+
+        /// <summary>
+        /// 【按名称选中删除】—— 唯一保留的删除路径（官方论坛验证 + 用户实测有效）：
+        /// 插入时用 SketchPicture.GetFeature().Name 统一命名（QR_FEATURE_MARKER），
+        /// 删除时用 SelectByID2(名称, "SKETCHBITMAP", 0,0,0,...) 按名称精确选中后删除。
+        /// 全程仅按名称查找，选不中立即退出——无坐标扫描、无全页遍历、无特征树遍历，
+        /// 仅 2~3 次选择调用，速度最快。
+        /// 同名可能累积多张（历史删除失败留下的），循环删到选不中为止。
+        /// </summary>
+        private int DeletePicturesByName(ModelDoc2 modDoc)
+        {
+            if (modDoc == null) return 0;
+
+            int deleted = 0;
+            for (int i = 0; i < 10; i++)
+            {
+                try
+                {
+                    modDoc.ClearSelection2(true);
+                    if (!modDoc.Extension.SelectByID2(QR_FEATURE_MARKER, "SKETCHBITMAP", 0, 0, 0, false, 0, null, 0))
+                        break;
+                    if (modDoc.ISelectionManager.GetSelectedObjectCount2(-1) != 1)
+                    { modDoc.ClearSelection2(true); break; }
+
+                    modDoc.Extension.DeleteSelection2(1);
+                    modDoc.ClearSelection2(true);
+                    deleted++;
+                }
+                catch (Exception) { modDoc.ClearSelection2(true); break; }
+            }
+            return deleted;
         }
 
         /// <summary>
@@ -329,50 +342,26 @@ namespace Mtools
 
             const double QR_SIZE_M = 0.030;
             const double OFFSET_LEFT_M = 0.007;
-            const double OFFSET_BOTTOM_M = 0.007;
-            const double TEXT_TARGET_CENTER_X_M = 0.022;
-            const double TEXT_TARGET_BOTTOM_Y_M = 0.010;
-            const double TEXT_HEIGHT_M = 0.0028;
+            const double QR_POS_Y_M = 0.010;                // 二维码插入点 Y = 10mm
+            const double TEXT_TARGET_X_M = OFFSET_LEFT_M;   // 文本左边缘 X = 7mm（与二维码插入点左对齐）
+            const double TEXT_TARGET_TOP_Y_M = 0.010;       // 文本插入点 Y = 10mm（左上角对齐到插入点）
+            const double TEXT_HEIGHT_M = 0.0035;            // 文本字体大小 = 3.5mm
 
             // 二维码图片尺寸和位置（与图纸比例相关）
             double qrSize = QR_SIZE_M * scaleFactor;
             double posX   = OFFSET_LEFT_M   * scaleFactor;
-            double posY   = OFFSET_BOTTOM_M * scaleFactor;
+            double posY   = QR_POS_Y_M * scaleFactor;   // 插入点 Y = 10mm
 
             // ===== 删除上次插入的二维码图片和文字 =====
-            // 方案：
-            // 1) Picture 删除：进入草图编辑模式，用 SelectByID2(type="Picture") 选中删除
-            // 2) Note 删除：用 IModelDoc2.GetFirstNote() + GetNext() 遍历所有 Note
+            // 1) Picture 删除：按名称选中删除（唯一保留路径，最快）。
+            //    插入时已把图片特征命名为 QR_FEATURE_MARKER，
+            //    用 SelectByID2(名称, "SKETCHBITMAP") 按名称精确选中后删除，无任何扫描。
+            // 2) Note 删除：遍历所有 Note，找 TS 开头的删除
             try
             {
-                // 1) 进入草图编辑模式，选中删除 Picture
-                modDoc.SketchManager.InsertSketch(true);  // 进入/退出草图
-                for (int i = 0; i < 5; i++)
-                {
-                    modDoc.ClearSelection2(true);
-                    // 用二维码中心点选中 Picture
-                    double probeX = posX + qrSize / 2.0;
-                    double probeY = posY + qrSize / 2.0;
-                    bool sel = modDoc.Extension.SelectByID2(
-                        "", "Picture", probeX, probeY, 0, false, 0, null, 0);
-                    if (!sel) break;
-
-                    int selCount = modDoc.ISelectionManager.GetSelectedObjectCount2(-1);
-                    int objType = (selCount > 0) ? modDoc.ISelectionManager.GetSelectedObjectType3(1, -1) : -1;
-
-                    // swSelPICTURE = 70, swSelSKETCHPICTURE = 85
-                    if (selCount == 1 && (objType == 70 || objType == 85))
-                    {
-                        modDoc.Extension.DeleteSelection2(1);
-                        modDoc.ClearSelection2(true);
-                    }
-                    else
-                    {
-                        modDoc.ClearSelection2(true);
-                        break;
-                    }
-                }
-                modDoc.SketchManager.InsertSketch(true);  // 退出草图
+                // 1) 删除旧二维码图片（按名称，选不中立即退出）
+                try { DeletePicturesByName(modDoc); }
+                catch (Exception) { }
 
                 // 2) 用反射调用 GetAnnotations 获取所有 Annotation，找 TS 开头的 Note 删除
                 try
@@ -412,8 +401,8 @@ namespace Mtools
                     else
                     {
                         // GetAnnotations 返回 null，用 SelectByID2(type="NOTE") 选中删除
-                        double noteX = TEXT_TARGET_CENTER_X_M;
-                        double noteY = TEXT_TARGET_BOTTOM_Y_M;
+                        double noteX = TEXT_TARGET_X_M;
+                        double noteY = TEXT_TARGET_TOP_Y_M;
                         for (int i = 0; i < 5; i++)
                         {
                             modDoc.ClearSelection2(true);
@@ -462,9 +451,11 @@ namespace Mtools
 
             modDoc.ClearSelection2(true);
 
-            // 文本"纸面目标坐标"（常量，与比例无关）
-            double api_setPositionX = TEXT_TARGET_CENTER_X_M;
-            double api_setPositionY = TEXT_TARGET_BOTTOM_Y_M;
+            // 文本"纸面目标坐标"（常量，与比例无关）：
+            //   X = 7mm（与二维码插入点左对齐），Y = 10mm
+            //   CreateText2 的坐标即文本左上角，配合左对齐实现"左上对齐到插入点"
+            double api_setPositionX = TEXT_TARGET_X_M;
+            double api_setPositionY = TEXT_TARGET_TOP_Y_M;
 
             // 插入草图图片（在当前图纸空间）
             if (!(modDoc.SketchManager.InsertSketchPicture(imagePath) is SketchPicture sketchPic))
@@ -474,17 +465,27 @@ namespace Mtools
             sketchPic.SetSize(qrSize, qrSize, false);
             sketchPic.Angle = 0;
 
-            // 【关键】设置草图图片透明度模式 = "从文件"
+            // 写入特征名标记，供下次插入时精确识别并删除（覆盖"旧二维码无法删除"问题）
+            try
+            {
+                if (sketchPic.GetFeature() is IFeature qrFeature)
+                {
+                    qrFeature.Name = QR_FEATURE_MARKER;
+                }
+            }
+            catch (Exception) { }
+
+            // 【关键】设置草图图片透明度模式
+            // 二维码已改为"白底 BMP"（无 alpha 通道），故关闭透明度，使白底为不透明白。
             // ISketchPicture.SetTransparency 签名（SW 2024+）：
-            //   useTransparencyFromFile (int)    : 1 = 使用 PNG 文件本身的 alpha 透明通道
+            //   useTransparencyFromFile (int)    : 0 = 不使用文件透明通道（BMP 无 alpha）
             //   transparentColor        (double): 当 useTransparencyFromFile=0 时指定 RGB 透明色（0 表示无）
             //   useMatchingTolerance    (int)   : 1 = 启用颜色容差, 0 = 不启用
             //   matchingTolerance       (double): 颜色容差（0.0 ~ 1.0）
-            // 这里 useTransparencyFromFile=1 → SW 读取 PNG 的 alpha=0 像素并显示为透明，
-            // 黑色模块（alpha=255）正常显示。
+            // 这里 useTransparencyFromFile=0 → BMP 白底整体不透明显示，二维码为白底黑模块。
             try
             {
-                sketchPic.SetTransparency(1, 0.0, 0, 0.0);
+                sketchPic.SetTransparency(0, 0.0, 0, 0.0);
             }
             catch (Exception) {
                 // 兼容性兜底：部分 SW 版本 API 签名或调用顺序不同，不影响主流程
@@ -504,7 +505,6 @@ namespace Mtools
 
             double createText2_UpperLeftX = api_setPositionX;
             double createText2_UpperLeftY = api_setPositionY;
-
             object noteObj;
             try
             {
@@ -541,7 +541,8 @@ namespace Mtools
                 textNote = insertedNote;
             }
 
-            try { textNote.SetTextJustification((int)swTextJustification_e.swTextJustificationCenter); }
+            // 左对齐：文本从插入点向右延伸（配合 CreateText2 左上角坐标 = 左上对齐到插入点）
+            try { textNote.SetTextJustification((int)swTextJustification_e.swTextJustificationLeft); }
             catch (Exception) {}
             try { textNote.Angle = 0; } catch { }
 
@@ -558,8 +559,8 @@ namespace Mtools
             catch (Exception) {}
 
             // 最终精确定位：
-            //   X = api_setPositionX(纸面 22mm)
-            //   Y = api_setPositionY(纸面 5mm)
+            //   X = 纸面 7mm（与二维码插入点左对齐，文本向右延伸）
+            //   Y = 纸面 10mm
             textAnno.SetPosition2(api_setPositionX, api_setPositionY, 0);
             modDoc.ClearSelection2(true);
 
